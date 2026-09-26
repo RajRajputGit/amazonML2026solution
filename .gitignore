@@ -4,6 +4,9 @@ scratch/
 output/
 data/
 dataset/
+artifacts/
+__MACOSX/
+._*
 
 # Python & Cache
 __pycache__/
@@ -25,3 +28,4 @@ ENV/
 # Logs and temporary binary/data outputs
 *.log
 *.pkl
+
