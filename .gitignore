@@ -29,3 +29,11 @@ ENV/
 *.log
 *.pkl
 
+
+cache/
+dataset/
+output/
+artifacts/
+*.duckdb
+*.parquet
+*.pkl

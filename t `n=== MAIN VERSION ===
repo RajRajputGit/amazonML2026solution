@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-import gc
 import re
 import time
-from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -23,8 +21,6 @@ def _append(cands: dict[tuple[str, str], dict], s1_id: str, cid: str, source: st
             "suffix_name_block": 0,
             "rare_token_block": 0,
             "address_block": 0,
-            "token_sorted_name_block": 0,
-            "first2_token_block": 0,
             "name_tfidf_block": 0,
             "address_tfidf_block": 0,
             "name_tfidf_score": 0.0,
@@ -50,52 +46,6 @@ def exact_block(s1, others, left_col, right_col, method, cands):
         merged = left.merge(right, on=["country", "_key"], how="inner")
         for s1_id, cid in merged[["s1_id", "candidate_id"]].itertuples(index=False):
             _append(cands, str(s1_id), str(cid), source, method)
-
-
-def token_sorted_name_block(s1, others, cands, max_bucket=500):
-    def key(text):
-        toks = sorted(t for t in str(text).split() if len(t) > 1)
-        return " ".join(toks)
-
-    left = s1[["entity_id", "country", "clean_name"]].copy()
-    left["_key"] = left["clean_name"].map(key)
-    left = left[left["_key"] != ""]
-    for source, df in others.items():
-        right = df[["entity_id", "country", "clean_name"]].copy()
-        right["_key"] = right["clean_name"].map(key)
-        right = right[right["_key"] != ""]
-        bucket_sizes = right.groupby(["country", "_key"], observed=True).size().rename("_bucket_size").reset_index()
-        right = right.merge(bucket_sizes[bucket_sizes["_bucket_size"] <= max_bucket][["country", "_key"]], on=["country", "_key"], how="inner")
-        merged = left.merge(right[["entity_id", "country", "_key"]], on=["country", "_key"], how="inner")
-        for s1_id, cid in merged[["entity_id_x", "entity_id_y"]].itertuples(index=False):
-            _append(cands, str(s1_id), str(cid), source, "token_sorted_name_block")
-        del right, merged
-        gc.collect()
-    del left
-    gc.collect()
-
-
-def first2_token_block(s1, others, cands, max_bucket=500):
-    def key(text):
-        toks = [t for t in str(text).split() if len(t) > 1]
-        return " ".join(toks[:2]) if len(toks) >= 2 else ""
-
-    left = s1[["entity_id", "country", "clean_name"]].copy()
-    left["_key"] = left["clean_name"].map(key)
-    left = left[left["_key"] != ""]
-    for source, df in others.items():
-        right = df[["entity_id", "country", "clean_name"]].copy()
-        right["_key"] = right["clean_name"].map(key)
-        right = right[right["_key"] != ""]
-        bucket_sizes = right.groupby(["country", "_key"], observed=True).size().rename("_bucket_size").reset_index()
-        right = right.merge(bucket_sizes[bucket_sizes["_bucket_size"] <= max_bucket][["country", "_key"]], on=["country", "_key"], how="inner")
-        merged = left.merge(right[["entity_id", "country", "_key"]], on=["country", "_key"], how="inner")
-        for s1_id, cid in merged[["entity_id_x", "entity_id_y"]].itertuples(index=False):
-            _append(cands, str(s1_id), str(cid), source, "first2_token_block")
-        del right, merged
-        gc.collect()
-    del left
-    gc.collect()
 
 
 def rare_token_block(s1, others, cands, max_df=500, max_tokens_per_s1=6, max_bucket=250):
@@ -145,7 +95,7 @@ def address_block(s1, others, cands, max_bucket=200):
                         _append(cands, str(eid), cid, source, "address_block")
 
 
-def tfidf_block(s1, others, cands, field, method, top_k=20, batch_size=500):
+def tfidf_block(s1, others, cands, field, method, top_k=20, batch_size=5000):
     corpus = []
     meta = []
     for source, df in others.items():
@@ -162,62 +112,31 @@ def tfidf_block(s1, others, cands, field, method, top_k=20, batch_size=500):
             row = scores.getrow(local_i)
             if row.nnz == 0:
                 continue
-            s1_id, s1_country = s1_meta[start + local_i]
-            same_country_positions = [
-                pos for pos, idx in enumerate(row.indices)
-                if meta[idx][1] == str(s1_country)
-            ]
-            if not same_country_positions:
-                continue
-            same_country_positions = np.array(same_country_positions, dtype=np.int32)
-            if same_country_positions.size > top_k:
-                pick = same_country_positions[np.argpartition(row.data[same_country_positions], -top_k)[-top_k:]]
+            if row.nnz > top_k:
+                pick = np.argpartition(row.data, -top_k)[-top_k:]
             else:
-                pick = same_country_positions
+                pick = np.arange(row.nnz)
             order = pick[np.argsort(row.data[pick])[::-1]]
+            s1_id, s1_country = s1_meta[start + local_i]
             rank = 0
             for pos in order:
                 cid, country, source = meta[row.indices[pos]]
+                if country != str(s1_country):
+                    continue
                 rank += 1
                 _append(cands, str(s1_id), cid, source, method, float(row.data[pos]), rank)
-        del scores
-        gc.collect()
-    del left, right, vectorizer, corpus, meta, s1_meta
-    gc.collect()
 
 
-def generate_candidates(
-    s1,
-    s2,
-    s3,
-    config,
-    checkpoint: Callable[[str, dict], None] | None = None,
-) -> tuple[pd.DataFrame, dict]:
+def generate_candidates(s1, s2, s3, config) -> tuple[pd.DataFrame, dict]:
     t0 = time.time()
     cands = {}
     others = {"S2": s2, "S3": s3}
-
-    def finish_stage(stage: str) -> None:
-        if checkpoint is not None:
-            checkpoint(stage, cands)
-        gc.collect()
-
     exact_block(s1, others, "clean_name", "clean_name", "exact_name_block", cands)
-    finish_stage("exact_name")
     exact_block(s1, others, "suffix_normalized_name", "suffix_normalized_name", "suffix_name_block", cands)
-    finish_stage("suffix_name")
-    token_sorted_name_block(s1, others, cands)
-    finish_stage("token_sorted_name")
-    first2_token_block(s1, others, cands)
-    finish_stage("first2_token")
     rare_token_block(s1, others, cands)
-    finish_stage("rare_token")
     address_block(s1, others, cands)
-    finish_stage("address")
     tfidf_block(s1, others, cands, "clean_name", "name_tfidf_block", top_k=config["name_top_k"])
-    finish_stage("name_tfidf")
     tfidf_block(s1, others, cands, "clean_address", "address_tfidf_block", top_k=config["address_top_k"])
-    finish_stage("address_tfidf")
     out = pd.DataFrame(cands.values())
     if len(out):
         block_cols = [c for c in out.columns if c.endswith("_block")]
@@ -230,17 +149,9 @@ def candidate_stats(candidates: pd.DataFrame, total_s1: int, total_s2s3: int, tr
     found = set(zip(candidates["s1_id"].astype(str), candidates["candidate_id"].astype(str))) if len(candidates) else set()
     per_s1 = candidates.groupby("s1_id").size() if len(candidates) else pd.Series(dtype=int)
     recovered = len(true_pairs & found)
-    truth_by_s1 = defaultdict(set)
-    found_by_s1 = defaultdict(set)
-    for s1_id, cid in true_pairs:
-        truth_by_s1[s1_id].add(cid)
-    for s1_id, cid in found & true_pairs:
-        found_by_s1[s1_id].add(cid)
-    covered = sum(1 for s1_id, matches in truth_by_s1.items() if matches <= found_by_s1.get(s1_id, set()))
     return {
         "true_links_recovered": int(recovered),
         "candidate_recall": recovered / len(true_pairs) if true_pairs else 0.0,
-        "entity_coverage": covered / len(truth_by_s1) if truth_by_s1 else 0.0,
         "total_candidate_pairs": int(len(candidates)),
         "mean_candidates_per_s1": float(per_s1.mean()) if len(per_s1) else 0.0,
         "median_candidates_per_s1": float(per_s1.median()) if len(per_s1) else 0.0,
